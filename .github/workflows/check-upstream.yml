@@ -1,0 +1,61 @@
+name: Check Upstream Release
+
+on:
+  schedule:
+    # Runs every Monday at 00:00 UTC
+    - cron: '0 0 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      new_version: ${{ steps.compare.outputs.new_version }}
+      upstream_tag: ${{ steps.upstream.outputs.tag }}
+
+    steps:
+      - name: Get latest upstream release tag
+        id: upstream
+        run: |
+          TAG=$(curl -fsSL "https://api.github.com/repos/looplj/axonhub/releases/latest" \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            | jq -r '.tag_name')
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "Latest upstream tag: ${TAG}"
+
+      - name: Get latest release tag in this repo
+        id: current
+        run: |
+          TAG=$(curl -fsSL "https://api.github.com/repos/${{ github.repository }}/releases/latest" \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            | jq -r '.tag_name // empty')
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "Current repo tag: ${TAG}"
+
+      - name: Compare versions
+        id: compare
+        run: |
+          UPSTREAM="${{ steps.upstream.outputs.tag }}"
+          CURRENT="${{ steps.current.outputs.tag }}"
+          echo "Upstream: ${UPSTREAM}  Current: ${CURRENT}"
+          if [ -z "${UPSTREAM}" ] || [ "${UPSTREAM}" = "null" ]; then
+            echo "Could not determine upstream version, skipping."
+            echo "new_version=false" >> "$GITHUB_OUTPUT"
+          elif [ "${UPSTREAM}" != "${CURRENT}" ]; then
+            echo "New version detected: ${UPSTREAM}"
+            echo "new_version=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Already up-to-date (${CURRENT})."
+            echo "new_version=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  trigger-build:
+    needs: check
+    if: needs.check.outputs.new_version == 'true'
+    uses: ./.github/workflows/build-freebsd.yml
+    with:
+      upstream_tag: ${{ needs.check.outputs.upstream_tag }}
+    secrets: inherit
