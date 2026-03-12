@@ -1,0 +1,133 @@
+name: Build for FreeBSD
+
+on:
+  workflow_call:
+    inputs:
+      upstream_tag:
+        description: 'Upstream axonhub tag to build (e.g. v0.9.14)'
+        required: true
+        type: string
+  workflow_dispatch:
+    inputs:
+      upstream_tag:
+        description: 'Upstream axonhub tag to build (e.g. v0.9.14). Leave empty to use the latest release.'
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Resolve upstream tag
+        id: tag
+        run: |
+          TAG="${{ inputs.upstream_tag }}"
+          if [ -z "${TAG}" ]; then
+            TAG=$(curl -fsSL "https://api.github.com/repos/looplj/axonhub/releases/latest" \
+              -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+              | jq -r '.tag_name')
+          fi
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "Building tag: ${TAG}"
+
+      - name: Checkout upstream source at tag
+        uses: actions/checkout@v4
+        with:
+          repository: looplj/axonhub
+          ref: ${{ steps.tag.outputs.tag }}
+          fetch-depth: 1
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'pnpm'
+          cache-dependency-path: frontend/pnpm-lock.yaml
+
+      - name: Install frontend dependencies
+        run: pnpm install
+        working-directory: frontend
+
+      - name: Build frontend
+        run: pnpm vite build
+        working-directory: frontend
+
+      - name: Copy frontend dist to server static directory
+        run: |
+          rm -rf internal/server/static/dist/assets
+          mkdir -p internal/server/static/dist
+          cp -r frontend/dist/* internal/server/static/dist/
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache: true
+
+      - name: Cross-compile for FreeBSD amd64
+        env:
+          GOOS: freebsd
+          GOARCH: amd64
+          CGO_ENABLED: '0'
+        run: |
+          TAG="${{ steps.tag.outputs.tag }}"
+          COMMIT=$(git rev-parse HEAD)
+          BUILD_TIME=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+          go build \
+            -tags=nomsgpack \
+            -ldflags "-s -w \
+              -X github.com/looplj/axonhub/internal/build.Version=${TAG} \
+              -X github.com/looplj/axonhub/internal/build.Commit=${COMMIT} \
+              -X github.com/looplj/axonhub/internal/build.BuildTime=${BUILD_TIME}" \
+            -o axonhub \
+            ./cmd/axonhub
+
+      - name: Package release archive
+        run: |
+          TAG="${{ steps.tag.outputs.tag }}"
+          VERSION="${TAG#v}"
+          ARCHIVE="axonhub_freebsd_amd64.zip"
+          # Always include the binary; add optional upstream files if they exist
+          ZIP_FILES="axonhub"
+          for f in deploy/start.sh deploy/stop.sh deploy/install.sh LICENSE; do
+            [ -f "$f" ] && ZIP_FILES="$ZIP_FILES $f"
+          done
+          zip "${ARCHIVE}" $ZIP_FILES
+          echo "archive=${ARCHIVE}" >> "$GITHUB_ENV"
+          echo "version=${VERSION}" >> "$GITHUB_ENV"
+          echo "tag=${TAG}" >> "$GITHUB_ENV"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: ${{ steps.tag.outputs.tag }}
+          body: |
+            FreeBSD amd64 build of [AxonHub ${{ steps.tag.outputs.tag }}](https://github.com/looplj/axonhub/releases/tag/${{ steps.tag.outputs.tag }}) for [Serv00](https://www.serv00.com/).
+
+            ## 安装方式 / Installation
+
+            ```sh
+            # Download and extract
+            fetch https://github.com/${{ github.repository }}/releases/download/${{ steps.tag.outputs.tag }}/axonhub_freebsd_amd64.zip
+            unzip axonhub_freebsd_amd64.zip
+            chmod +x axonhub
+            ./axonhub
+            ```
+
+            ## 说明 / Notes
+
+            - OS: FreeBSD amd64 (Serv00)
+            - Upstream: https://github.com/looplj/axonhub/releases/tag/${{ steps.tag.outputs.tag }}
+            - CGO_ENABLED=0 (pure Go, no system libs required)
+          files: ${{ env.archive }}
+          fail_on_unmatched_files: true
